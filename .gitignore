@@ -1,0 +1,3 @@
+board.json
+*.tmp
+__pycache__/

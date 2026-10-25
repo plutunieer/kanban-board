@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kanban-Board</title>
+<style>
+  :root {
+    --bg: #f4f1ea; --spalte: #e9e4d8; --karte: #ffffff; --text: #1f1f1f; --leise: #5a5a5a;
+    --rand: #d3ccbc; --akzent: #2f6f4f; --rot: #b3261e; --rot-bg: #f6d6d3; --hell-akzent: #d4ebdc;
+  }
+  :root[data-theme="dark"] {
+    --bg: #1d1f22; --spalte: #2a2d31; --karte: #34383d; --text: #e6e2d8; --leise: #b0aca2;
+    --rand: #474b51; --akzent: #7cc39b; --rot: #ff8a80; --rot-bg: #4a2422; --hell-akzent: #2f4a3a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0 auto 0 0; }
+  button, input, textarea { font: inherit; color: var(--text); }
+  button { background: var(--karte); border: 1px solid var(--rand); border-radius: 8px;
+           padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: var(--akzent); }
+  .haupt { background: var(--hell-akzent); border: 2px solid var(--akzent); font-weight: 600; }
+  label.wip { display: flex; align-items: center; gap: 6px; color: var(--leise); }
+  label.wip input { width: 56px; padding: 4px 6px; border: 1px solid var(--rand); border-radius: 6px;
+                    background: var(--karte); }
+  main { display: grid; grid-template-columns: repeat(3, minmax(240px, 1fr)); gap: 16px;
+         padding: 0 20px 20px; overflow-x: auto; }
+  .spalte { background: var(--spalte); border: 2px solid transparent; border-radius: 12px;
+            padding: 12px; min-height: 70vh; display: flex; flex-direction: column; gap: 10px; }
+  .spalte.ueber { background: var(--rot-bg); border-color: var(--rot); }
+  .spalte.ziel { border-color: var(--akzent); border-style: dashed; }
+  .kopf { display: flex; justify-content: space-between; align-items: baseline; font-weight: 600; }
+  .zahl { color: var(--leise); font-weight: 400; }
+  .spalte.ueber .zahl { color: var(--rot); font-weight: 700; }
+  .karte { background: var(--karte); border: 1px solid var(--rand); border-radius: 10px;
+           padding: 10px 12px; cursor: grab; }
+  .karte.zieht { opacity: .4; }
+  .karte .titel { font-weight: 600; word-break: break-word; }
+  .karte .notiz { color: var(--leise); font-size: 14px; white-space: pre-wrap; word-break: break-word;
+                  margin-top: 4px; }
+  .karte .knoepfe { display: flex; gap: 6px; margin-top: 8px; }
+  .karte .knoepfe button { padding: 2px 8px; font-size: 13px; }
+  .leer { color: var(--leise); font-size: 14px; text-align: center; padding: 20px 0; }
+  .fehler { background: var(--rot-bg); color: var(--rot); padding: 8px 20px; display: none; }
+  .hinweis { background: var(--spalte); padding: 8px 20px; display: none; }
+  .hinweis button { margin-left: 8px; }
+  dialog { border: 1px solid var(--rand); border-radius: 12px; background: var(--karte); color: var(--text);
+           width: min(440px, 92vw); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog form { display: flex; flex-direction: column; gap: 10px; }
+  dialog input, dialog textarea { width: 100%; padding: 8px; border: 1px solid var(--rand);
+           border-radius: 8px; background: var(--bg); }
+  dialog textarea { min-height: 90px; resize: vertical; }
+  .zeile { display: flex; justify-content: flex-end; gap: 8px; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } .spalte { min-height: 0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kanban-Board</h1>
+  <label class="wip">Grenze „In Arbeit“: <input id="wip" type="number" min="1" max="99"></label>
+  <button id="thema" type="button">Dunkel</button>
+  <button id="neu" class="haupt" type="button">+ Aufgabe</button>
+</header>
+<div class="fehler" id="fehler"></div>
+<div class="hinweis" id="hinweis"></div>
+<main id="board"></main>
+
+<dialog id="dlg">
+  <form method="dialog" id="form">
+    <strong id="dlgTitel">Neue Aufgabe</strong>
+    <input id="fTitel" placeholder="Was ist zu tun?" maxlength="200" required>
+    <textarea id="fNotiz" placeholder="Notiz (optional)" maxlength="5000"></textarea>
+    <div class="zeile">
+      <button type="button" id="abbrechen">Abbrechen</button>
+      <button type="submit" class="haupt">Speichern</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+const ARBEIT = "arbeit";
+let board = null;
+let bearbeiteId = null;
+
+const $ = (id) => document.getElementById(id);
+
+function fehler(text) {
+  $("fehler").textContent = text;
+  $("fehler").style.display = text ? "block" : "none";
+}
+
+async function laden() {
+  try {
+    const r = await fetch("/api/board");
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).fehler || r.status);
+    board = await r.json();
+    zeichnen();
+  } catch (e) {
+    fehler("Board konnte nicht geladen werden: " + (e.message === "Failed to fetch" ? "Server läuft nicht (start.command doppelklicken)" : e.message));
+  }
+}
+
+// Speichern nacheinander: läuft schon eines, wird danach nur der neueste Stand gesendet.
+let speichertGerade = false;
+let nochmal = false;
+async function speichern() {
+  if (speichertGerade) { nochmal = true; return; }
+  speichertGerade = true;
+  try {
+    do {
+      nochmal = false;
+      const r = await fetch("/api/board", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(board),
+      });
+      if (!r.ok) throw new Error(r.status);
+    } while (nochmal);
+    fehler("");
+  } catch (e) {
+    fehler("Speichern fehlgeschlagen – Änderung ist nur im Fenster, nicht in der Datei. (" + e.message + ")");
+  } finally {
+    speichertGerade = false;
+  }
+}
+
+function zeichnen() {
+  $("wip").value = board.wipLimit;
+  const main = $("board");
+  main.innerHTML = "";
+  for (const sp of board.spalten) {
+    const karten = board.aufgaben.filter((a) => a.spalte === sp.id);
+    const ueber = sp.id === ARBEIT && karten.length > board.wipLimit;
+    const el = document.createElement("section");
+    el.className = "spalte" + (ueber ? " ueber" : "");
+    el.dataset.spalte = sp.id;
+    const kopf = document.createElement("div");
+    kopf.className = "kopf";
+    kopf.innerHTML = `<span></span><span class="zahl"></span>`;
+    kopf.children[0].textContent = sp.name;
+    kopf.children[1].textContent = sp.id === ARBEIT ? `${karten.length} / ${board.wipLimit}` : karten.length;
+    if (ueber) kopf.title = "Zu viel gleichzeitig in Arbeit";
+    el.appendChild(kopf);
+    if (!karten.length) {
+      const l = document.createElement("div");
+      l.className = "leer";
+      l.textContent = "Hierher ziehen";
+      el.appendChild(l);
+    }
+    karten.forEach((a) => el.appendChild(karteBauen(a, sp.id)));
+    zielMachen(el);
+    main.appendChild(el);
+  }
+}
+
+function karteBauen(a, spalteId) {
+  const k = document.createElement("article");
+  k.className = "karte";
+  k.draggable = true;
+  k.dataset.id = a.id;
+  const t = document.createElement("div");
+  t.className = "titel";
+  t.textContent = a.titel;
+  k.appendChild(t);
+  if (a.notiz) {
+    const n = document.createElement("div");
+    n.className = "notiz";
+    n.textContent = a.notiz;
+    k.appendChild(n);
+  }
+  const kn = document.createElement("div");
+  kn.className = "knoepfe";
+  const idx = board.spalten.findIndex((s) => s.id === spalteId);
+  if (idx < board.spalten.length - 1) kn.appendChild(knopf("Weiter →", () => verschieben(a.id, board.spalten[idx + 1].id)));
+  kn.appendChild(knopf("Bearbeiten", () => dialogOeffnen(a)));
+  kn.appendChild(knopf("Löschen", () => loeschen(a.id)));
+  k.appendChild(kn);
+  k.addEventListener("dragstart", (e) => {
+    e.dataTransfer.setData("text/plain", a.id);
+    k.classList.add("zieht");
+  });
+  k.addEventListener("dragend", () => k.classList.remove("zieht"));
+  return k;
+}
+
+function knopf(text, fn) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = text;
+  b.addEventListener("click", fn);
+  return b;
+}
+
+function zielMachen(el) {
+  el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("ziel"); });
+  el.addEventListener("dragleave", (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove("ziel"); });
+  el.addEventListener("drop", (e) => {
+    e.preventDefault();
+    el.classList.remove("ziel");
+    const id = e.dataTransfer.getData("text/plain");
+    // Position in der Spalte: vor der Karte, über der losgelassen wurde
+    const unter = [...el.querySelectorAll(".karte")].find((k) => {
+      const r = k.getBoundingClientRect();
+      return e.clientY < r.top + r.height / 2 && k.dataset.id !== id;
+    });
+    verschieben(id, el.dataset.spalte, unter ? unter.dataset.id : null);
+  });
+}
+
+function verschieben(id, spalte, vorId = null) {
+  const i = board.aufgaben.findIndex((a) => a.id === id);
+  if (i < 0) return;
+  const [a] = board.aufgaben.splice(i, 1);
+  a.spalte = spalte;
+  const j = vorId ? board.aufgaben.findIndex((x) => x.id === vorId) : -1;
+  if (j >= 0) board.aufgaben.splice(j, 0, a); else board.aufgaben.push(a);
+  zeichnen();
+  speichern();
+}
+
+function loeschen(id) {
+  // ohne Rückfrage-Fenster; stattdessen „Rückgängig“ in der Leiste oben
+  const i = board.aufgaben.findIndex((x) => x.id === id);
+  if (i < 0) return;
+  const [a] = board.aufgaben.splice(i, 1);
+  zeichnen();
+  speichern();
+  rueckgaengigAnbieten(a, i);
+}
+
+let hinweisTimer = null;
+function rueckgaengigAnbieten(a, i) {
+  const h = $("hinweis");
+  h.textContent = `„${a.titel}“ gelöscht.`;
+  h.appendChild(knopf("Rückgängig", () => {
+    board.aufgaben.splice(Math.min(i, board.aufgaben.length), 0, a);
+    zeichnen();
+    speichern();
+    h.style.display = "none";
+  }));
+  h.style.display = "block";
+  clearTimeout(hinweisTimer);
+  hinweisTimer = setTimeout(() => { h.style.display = "none"; }, 10000);
+}
+
+function dialogOeffnen(a = null) {
+  bearbeiteId = a ? a.id : null;
+  $("dlgTitel").textContent = a ? "Aufgabe bearbeiten" : "Neue Aufgabe";
+  $("fTitel").value = a ? a.titel : "";
+  $("fNotiz").value = a ? a.notiz || "" : "";
+  $("dlg").showModal();
+  $("fTitel").focus();
+}
+
+$("form").addEventListener("submit", () => {
+  if (!board) return;
+  const titel = $("fTitel").value.trim();
+  const notiz = $("fNotiz").value.trim();
+  if (!titel) return;
+  if (bearbeiteId) {
+    const a = board.aufgaben.find((x) => x.id === bearbeiteId);
+    if (a) { a.titel = titel; a.notiz = notiz; }
+  } else {
+    board.aufgaben.push({ id: crypto.randomUUID(), titel, notiz, spalte: board.spalten[0].id });
+  }
+  zeichnen();
+  speichern();
+});
+$("abbrechen").addEventListener("click", () => $("dlg").close());
+$("neu").addEventListener("click", () => { if (board) dialogOeffnen(); });
+$("wip").addEventListener("change", () => {
+  if (!board) return;
+  const n = parseInt($("wip").value, 10);
+  if (n >= 1 && n <= 99) { board.wipLimit = n; zeichnen(); speichern(); } else $("wip").value = board.wipLimit;
+});
+
+// Dunkelmodus: Wahl wird nur in diesem Browser gemerkt
+function themaSetzen(t) {
+  document.documentElement.dataset.theme = t;
+  $("thema").textContent = t === "dark" ? "Hell" : "Dunkel";
+  try { localStorage.setItem("kanban-thema", t); } catch (e) {}
+}
+let gespeichert = "light";
+try { gespeichert = localStorage.getItem("kanban-thema") || "light"; } catch (e) {}
+themaSetzen(gespeichert);
+$("thema").addEventListener("click", () =>
+  themaSetzen(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
+
+laden();
+</script>
+</body>
+</html>
