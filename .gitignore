@@ -1,3 +1,7 @@
 board.json
 *.tmp
 __pycache__/
+kanban.db
+kanban.db-*
+Kanban.app/
+server.log

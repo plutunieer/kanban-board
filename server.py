@@ -1,19 +1,22 @@
 """Kanban-Board: kleiner lokaler Server auf http://localhost:8814.
 
-Liefert index.html aus und speichert das Board in board.json (gleicher Ordner).
+Liefert index.html aus und speichert das Board in der Datenbank kanban.db (SQLite, gleicher Ordner).
+Eine alte board.json wird beim ersten Start einmal übernommen und bleibt als Sicherung liegen.
 Nur Python-Standardbibliothek, lauscht nur auf 127.0.0.1.
 """
 import json
 import os
-import tempfile
+import sqlite3
 import threading
+from contextlib import contextmanager
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PORT = 8814
 ORDNER = Path(__file__).resolve().parent
-DATEI = ORDNER / "board.json"
+DB = ORDNER / "kanban.db"
+ALT = ORDNER / "board.json"  # früherer Speicherort, wird nur noch gelesen
 SEITE = ORDNER / "index.html"
 MAX_GROESSE = 5 * 1024 * 1024  # 5 MB reichen für Tausende Aufgaben
 ERLAUBTE_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}
@@ -30,23 +33,78 @@ LEER = {
 }
 
 
+@contextmanager
+def verbinden():
+    # Speichert bei Erfolg, nimmt bei Fehler alles zurück und schliesst die Verbindung immer.
+    db = sqlite3.connect(DB)
+    try:
+        db.execute("PRAGMA journal_mode=WAL")  # übersteht Abstürze, Lesen blockiert Schreiben nicht
+        with db:
+            yield db
+    finally:
+        db.close()
+
+
+def db_einrichten():
+    with verbinden() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS einstellungen (schluessel TEXT PRIMARY KEY, wert TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS spalten (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL, extra TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE IF NOT EXISTS aufgaben (
+                id TEXT PRIMARY KEY, titel TEXT NOT NULL, notiz TEXT NOT NULL, spalte TEXT NOT NULL,
+                position INTEGER NOT NULL, extra TEXT NOT NULL DEFAULT '{}');
+            """
+        )
+        befuellt = db.execute("SELECT 1 FROM einstellungen WHERE schluessel = 'wipLimit'").fetchone()
+    # Am Inhalt entscheiden, nicht an der Datei: bricht der Import ab, wird er beim nächsten Start wiederholt.
+    if not befuellt:
+        start = json.loads(ALT.read_text(encoding="utf-8")) if ALT.exists() else LEER
+        if not board_gueltig(start):
+            raise SystemExit("board.json hat ein falsches Format – nichts übernommen, bitte prüfen.")
+        board_speichern(start)
+
+
 def board_laden():
-    if not DATEI.exists():
-        return LEER
-    return json.loads(DATEI.read_text(encoding="utf-8"))
+    with SPERRE, verbinden() as db:  # nie mitten in ein Speichern hinein lesen
+        wip = db.execute("SELECT wert FROM einstellungen WHERE schluessel = 'wipLimit'").fetchone()
+        spalten = [
+            {**json.loads(extra), "id": id, "name": name}
+            for id, name, extra in db.execute("SELECT id, name, extra FROM spalten ORDER BY position")
+        ]
+        aufgaben = [
+            {**json.loads(extra), "id": id, "titel": titel, "notiz": notiz, "spalte": spalte}
+            for id, titel, notiz, spalte, extra in db.execute(
+                "SELECT id, titel, notiz, spalte, extra FROM aufgaben ORDER BY position")
+        ]
+    if wip is None:
+        raise ValueError("Datenbank ist leer")  # nie ein leeres Board ausliefern, das dann gespeichert würde
+    return {"wipLimit": int(wip[0]), "spalten": spalten, "aufgaben": aufgaben}
+
+
+def _extra(eintrag, bekannt):
+    # Felder, für die es (noch) keine eigene Spalte gibt, gehen nicht verloren, sondern landen hier.
+    return json.dumps({k: v for k, v in eintrag.items() if k not in bekannt}, ensure_ascii=False)
 
 
 def board_speichern(daten):
-    # Erst in eine eigene Zwischendatei schreiben, dann tauschen: so geht bei einem Absturz nichts kaputt.
-    with SPERRE:
-        fd, tmp = tempfile.mkstemp(dir=ORDNER, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(daten, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, DATEI)
-        except OSError:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+    # Alles in einem Rutsch: entweder steht der neue Stand komplett in der Datenbank oder gar nicht.
+    with SPERRE, verbinden() as db:
+        db.execute("DELETE FROM spalten")
+        db.execute("DELETE FROM aufgaben")
+        db.execute("INSERT OR REPLACE INTO einstellungen VALUES ('wipLimit', ?)", (str(daten["wipLimit"]),))
+        db.executemany(
+            "INSERT INTO spalten VALUES (?, ?, ?, ?)",
+            [(str(s["id"]), str(s.get("name", "")), i, _extra(s, {"id", "name"}))
+             for i, s in enumerate(daten["spalten"])],
+        )
+        db.executemany(
+            "INSERT INTO aufgaben VALUES (?, ?, ?, ?, ?, ?)",
+            [(str(a["id"]), str(a.get("titel", "")), str(a.get("notiz", "")), str(a.get("spalte", "")), i,
+              _extra(a, {"id", "titel", "notiz", "spalte"}))
+             for i, a in enumerate(daten["aufgaben"])],
+        )
 
 
 def board_gueltig(daten):
@@ -55,6 +113,8 @@ def board_gueltig(daten):
         and isinstance(daten.get("aufgaben"), list)
         and isinstance(daten.get("spalten"), list)
         and isinstance(daten.get("wipLimit"), int)
+        and not isinstance(daten["wipLimit"], bool)
+        and all(isinstance(x, dict) and "id" in x for x in daten["spalten"] + daten["aufgaben"])
     )
 
 
@@ -65,6 +125,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", typ)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Kanban-Speicher", "sqlite")  # daran erkennt Kanban.app, dass kein alter Server läuft
         self.end_headers()
         self.wfile.write(body)
 
@@ -83,8 +144,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/board":
             try:
                 self._antwort(200, json.dumps(board_laden(), ensure_ascii=False))
-            except ValueError:
-                self._antwort(500, '{"fehler": "board.json ist beschädigt"}')
+            except (ValueError, sqlite3.Error):
+                self._antwort(500, '{"fehler": "Datenbank kanban.db ist nicht lesbar"}')
         else:
             self._antwort(404, '{"fehler": "nicht gefunden"}')
 
@@ -113,8 +174,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._antwort(400, '{"fehler": "Board-Format falsch"}')
         try:
             board_speichern(daten)
-        except OSError:
-            return self._antwort(500, '{"fehler": "board.json konnte nicht geschrieben werden"}')
+        except (OSError, sqlite3.Error):
+            return self._antwort(500, '{"fehler": "Datenbank kanban.db konnte nicht geschrieben werden"}')
         self._antwort(200, '{"ok": true}')
 
     def log_message(self, *args):
@@ -122,6 +183,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    db_einrichten()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://localhost:{PORT}"
     print(f"Kanban-Board läuft: {url}  (beenden mit Ctrl+C)")
